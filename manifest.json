@@ -1,0 +1,9 @@
+{
+  "name": "VYOM",
+  "short_name": "VYOM",
+  "description": "Multi-domain weather intelligence and decision-support platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07111f",
+  "theme_color": "#07111f"
+}

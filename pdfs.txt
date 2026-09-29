@@ -1,0 +1,24 @@
+../.././imd_latest/contents/pdf/emrc_sop.pdf
+../.././imd_latest/contents/pdf/IMDposoco.pdf
+../.././imd_latest/contents/pdf/forecasting_sop.pdf
+../.././Forecast/marquee_data/ विज्ञप्ति 21.09.2026.pdf
+../.././imd_latest/contents/pdf/training_sop.pdf
+../.././imd_latest/contents/pdf/SOUVENIR.pdf
+../.././imd_latest/contents/pdf/aviation_sop.pdf
+../.././Forecast/marquee_data/Press Release 21-09-2026.pdf
+../.././imd_latest/contents/pdf/hydrology_sop.pdf
+../.././imd_latest/contents/pdf/FD2022POSTERBOOK.pdf
+https://imdpune.gov.in/caui/health.pdf
+https://mausam.imd.gov.in/Forecast/marquee_data/API_doc.pdf
+https://www.clivar.org/sites/default/files/documents/CLIVAR%20Exchanges%2079%20Monsoon%20Mission%20Final.pdf
+https://internal.imd.gov.in/section/nhac/dynamic/extended.pdf
+../.././Forecast/marquee_data/ERF 17.09.26.pdf
+../.././imd_latest/contents/pdf/cyclone_sop.pdf
+https://internal.imd.gov.in/section/nhac/dynamic/hmc.pdf
+../.././imd_latest/contents/pdf/FD2022POEMBOOK.pdf
+../.././imd_latest/contents/ar2022.pdf
+../.././imd_latest/contents/pdf/nwp_sop.pdf
+https://internal.imd.gov.in/recruits/20260907_rec_288.pdf
+../.././imd_latest/contents/pdf/gkms_sop.pdf
+../.././Forecast/marquee_data/Press Release 21-09-2026_1789980540.pdf
+https://internal.imd.gov.in/advertisements/20260514_advt_119.pdf
