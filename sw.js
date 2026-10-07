@@ -1,4 +1,4 @@
-const CACHE_NAME = "vyom-shell-v1";
+const CACHE_NAME = "vyom-shell-security-v2";
 const SHELL = ["/", "/index.html", "/manifest.json"];
 
 self.addEventListener("install", event => {
@@ -30,5 +30,10 @@ self.addEventListener("push", event => {
 
 self.addEventListener("notificationclick", event => {
   event.notification.close();
-  event.waitUntil(clients.openWindow((event.notification.data && event.notification.data.url) || "/"));
+  let destination = new URL("/", self.location.origin);
+  try {
+    const requested = new URL((event.notification.data && event.notification.data.url) || "/", self.location.origin);
+    if (requested.origin === self.location.origin) destination = requested;
+  } catch (_) {}
+  event.waitUntil(clients.openWindow(destination.href));
 });

@@ -1,12 +1,16 @@
 import io
+import json
+import logging
+import ssl
+import uuid
 import re
 import math
 import requests
 import statistics
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime
-from fastapi import FastAPI, Response, BackgroundTasks, WebSocket, WebSocketDisconnect, Header, HTTPException
+from datetime import datetime, timezone
+from fastapi import FastAPI, Response, BackgroundTasks, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 import edge_tts
@@ -53,18 +57,29 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-load_dotenv(override=True)
+load_dotenv(override=False)
+
+from security import (AuthenticatedUser, optional_user, require_user, require_admin, owned_user_id,
+                      authenticate_token, allowed_origins, verified_email_addresses, verified_alert_email)
+from alert_policy import validate_push_subscription
+from notifications import scan_users, CONSENT_VERSION
+from push_config import public_push_key
+
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # MONGODB SETUP (Replaced Supabase)
 # ==========================================
 MONGO_URI = os.getenv("MONGO_URI")
 try:
+    if not MONGO_URI:
+        raise RuntimeError("MONGO_URI is not configured")
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = mongo_client["weathergpt"]
     users_collection = db["users"]
     agro_states_collection = db["agro_field_states"]
     marine_states_collection = db["marine_voyage_states"]
+    alert_deliveries_collection = db["alert_deliveries"]
     mongo_client.server_info() # Trigger connection check
     print("MongoDB Connected Successfully!")
 except Exception as e:
@@ -72,9 +87,9 @@ except Exception as e:
     users_collection = None
     agro_states_collection = None
     marine_states_collection = None
-agency_alert_cache = {}
+    alert_deliveries_collection = None
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY")) if os.getenv("GROQ_API_KEY") else None
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 def safe_ai_completion(messages, temp=0.2):
@@ -88,6 +103,8 @@ def safe_ai_completion(messages, temp=0.2):
         return response.choices[0].message.content
     except Exception as groq_err:
         print(f"Groq API Failed ({groq_err}). Switching to Mistral AI Backup...")
+        if not MISTRAL_API_KEY:
+            return "SYSTEM ERROR: AI explanation providers are not configured or are unavailable."
         try:
             headers = {
                 "Authorization": f"Bearer {MISTRAL_API_KEY}",
@@ -133,25 +150,28 @@ PERSONA_GUIDELINES = {
 # USER SYNC ENDPOINTS (MongoDB)
 # ==========================================
 class UserProfileSync(BaseModel):
-    clerk_id: str
+    clerk_id: Optional[str] = None
     email: str = ""
     phone: str = ""
     language: str = "English"
     persona: str = "General Citizen"
     health_profile: str = "None"
-    lat: float = None
-    lon: float = None
+    lat: Optional[float] = Field(None, ge=-90, le=90, allow_inf_nan=False)
+    lon: Optional[float] = Field(None, ge=-180, le=180, allow_inf_nan=False)
 
 @app.post("/api/user/sync")
-def sync_user_profile(payload: UserProfileSync):
+def sync_user_profile(payload: UserProfileSync, user: AuthenticatedUser = Depends(require_user)):
+    user_id = owned_user_id(payload.clerk_id, user)
+    primary_email, _ = verified_email_addresses(user_id)
     if users_collection is None:
         return {"status": "error", "message": "MongoDB not initialized"}
     try:
-        update_data = payload.dict(exclude_none=True)
+        update_data = payload.model_dump(exclude_none=True)
+        update_data.update(clerk_id=user_id, email=primary_email)
         update_data["updated_at"] = datetime.utcnow().isoformat()
         
         users_collection.update_one(
-            {"clerk_id": payload.clerk_id},
+            {"clerk_id": user_id},
             {"$set": update_data},
             upsert=True
         )
@@ -160,12 +180,16 @@ def sync_user_profile(payload: UserProfileSync):
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/user/profile")
-def get_user_profile(clerk_id: str):
+def get_user_profile(clerk_id: Optional[str] = None, user: AuthenticatedUser = Depends(require_user)):
+    clerk_id = owned_user_id(clerk_id, user)
     if users_collection is None:
         return {"status": "error", "message": "MongoDB not initialized"}
     try:
         user = users_collection.find_one({"clerk_id": clerk_id}, {"_id": 0})
         if user:
+            if user.get("alert_consent_version") != CONSENT_VERSION:
+                user.update(alert_requires_renewal=bool(user.get("alert_enabled")),
+                            alert_enabled=False, push_subscription=None)
             return {"status": "success", "profile": user}
         return {"status": "not_found", "profile": None}
     except Exception as e:
@@ -173,20 +197,21 @@ def get_user_profile(clerk_id: str):
 
 class SavedLocation(BaseModel):
     name: str
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
 
 class UpdateLocationsRequest(BaseModel):
-    clerk_id: str
+    clerk_id: Optional[str] = None
     locations: list[SavedLocation]
 
 @app.post("/api/user/locations")
-def update_user_locations(payload: UpdateLocationsRequest):
+def update_user_locations(payload: UpdateLocationsRequest, user: AuthenticatedUser = Depends(require_user)):
+    user_id = owned_user_id(payload.clerk_id, user)
     if users_collection is None:
         return {"status": "error", "message": "MongoDB not initialized"}
     try:
         users_collection.update_one(
-            {"clerk_id": payload.clerk_id},
+            {"clerk_id": user_id},
             {"$set": {"saved_locations": [loc.dict() for loc in payload.locations]}},
             upsert=True
         )
@@ -195,28 +220,29 @@ def update_user_locations(payload: UpdateLocationsRequest):
         return {"status": "error", "message": str(e)}
 
 class AlertConfigUpdate(BaseModel):
-    clerk_id: str
+    clerk_id: Optional[str] = None
     alert_email: str = ""
-    alert_lat: float = None
-    alert_lon: float = None
-    alert_rain_threshold: float = 50.0
-    alert_heat_threshold: float = 42.0
-    alert_wind_threshold: float = 60.0
+    alert_lat: Optional[float] = Field(None, ge=-90, le=90, allow_inf_nan=False)
+    alert_lon: Optional[float] = Field(None, ge=-180, le=180, allow_inf_nan=False)
+    alert_rain_threshold: float = Field(50.0, gt=0, le=1000, allow_inf_nan=False)
+    alert_heat_threshold: float = Field(42.0, ge=-80, le=80, allow_inf_nan=False)
+    alert_wind_threshold: float = Field(60.0, gt=0, le=500, allow_inf_nan=False)
     alert_enabled: bool = False
     push_subscription: Optional[Dict[str, Any]] = None
 
 class LiveLocationUpdate(BaseModel):
-    clerk_id: str
-    alert_lat: float
-    alert_lon: float
+    clerk_id: Optional[str] = None
+    alert_lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    alert_lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
 
 @app.post("/api/alerts/live-location")
-def update_live_location(payload: LiveLocationUpdate):
+def update_live_location(payload: LiveLocationUpdate, user: AuthenticatedUser = Depends(require_user)):
+    user_id = owned_user_id(payload.clerk_id, user)
     if users_collection is None:
         return {"status": "error", "message": "MongoDB not initialized"}
     try:
         users_collection.update_one(
-            {"clerk_id": payload.clerk_id},
+            {"clerk_id": user_id},
             {"$set": {"alert_lat": payload.alert_lat, "alert_lon": payload.alert_lon}}
         )
         return {"status": "success"}
@@ -225,17 +251,29 @@ def update_live_location(payload: LiveLocationUpdate):
 
 
 @app.post("/api/alerts/config")
-def update_alert_config(payload: AlertConfigUpdate, background_tasks: BackgroundTasks):
+def update_alert_config(payload: AlertConfigUpdate, background_tasks: BackgroundTasks, user: AuthenticatedUser = Depends(require_user)):
+    user_id = owned_user_id(payload.clerk_id, user)
+    if payload.alert_enabled and (payload.alert_lat is None or payload.alert_lon is None):
+        raise HTTPException(400, "Alert coordinates are required")
+    recipient = verified_alert_email(user_id, payload.alert_email) if payload.alert_enabled else ""
+    try:
+        subscription = validate_push_subscription(payload.push_subscription) if payload.alert_enabled else None
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    update_data = payload.model_dump()
+    update_data.update(clerk_id=user_id, alert_email=recipient, push_subscription=subscription,
+                       push_vapid_public_key=public_push_key() if subscription else None,
+                       alert_consent_version=CONSENT_VERSION, alert_config_revision=uuid.uuid4().hex)
     if users_collection is None:
         return {"status": "error", "message": "MongoDB not initialized"}
     try:
         users_collection.update_one(
-            {"clerk_id": payload.clerk_id},
-            {"$set": payload.dict()},
+            {"clerk_id": user_id},
+            {"$set": update_data},
             upsert=True
         )
         if payload.alert_enabled:
-            background_tasks.add_task(scan_and_alert_users)
+            background_tasks.add_task(scan_and_alert_users, user_id)
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -245,302 +283,122 @@ def update_alert_config(payload: AlertConfigUpdate, background_tasks: Background
 # ==========================================
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
+        self.active_connections: Dict[str, set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, clerk_id: str):
-        await websocket.accept()
-        self.active_connections[clerk_id] = websocket
+    def connect(self, websocket: WebSocket, user_id: str):
+        self.active_connections.setdefault(user_id, set()).add(websocket)
 
-    def disconnect(self, clerk_id: str):
-        if clerk_id in self.active_connections:
-            del self.active_connections[clerk_id]
+    def disconnect(self, websocket: WebSocket, user_id: str):
+        sockets = self.active_connections.get(user_id, set())
+        sockets.discard(websocket)
+        if not sockets:
+            self.active_connections.pop(user_id, None)
 
-    async def send_personal_message(self, message: str, clerk_id: str):
-        if clerk_id in self.active_connections:
+    async def send_personal_message(self, message: str, user_id: str):
+        sent = False
+        for websocket in tuple(self.active_connections.get(user_id, set())):
             try:
-                await self.active_connections[clerk_id].send_text(message)
+                await websocket.send_text(message)
+                sent = True
             except Exception:
-                pass
+                self.disconnect(websocket, user_id)
+        return sent
 
 manager = ConnectionManager()
 
 @app.websocket("/ws/{clerk_id}")
 async def websocket_endpoint(websocket: WebSocket, clerk_id: str):
-    await manager.connect(websocket, clerk_id)
+    # Browsers cannot set Authorization headers on WebSocket handshakes. The first
+    # frame authenticates the transport; it is never registered for alerts before verification.
+    if websocket.headers.get("origin") not in allowed_origins():
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    user = None
     try:
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=5)
+        if len(raw) > 17000:
+            raise HTTPException(401, "Invalid authentication frame")
+        token = json.loads(raw).get("token")
+        user = await run_in_threadpool(authenticate_token, token)
+        owned_user_id(clerk_id, user)
+        manager.connect(websocket, user.user_id)
+        await websocket.send_json({"type": "authenticated"})
         while True:
-            await websocket.receive_text()
+            remaining = user.expires_at - time.time()
+            if remaining <= 0:
+                break
+            await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
+        await websocket.close(code=4401)
+    except HTTPException as exc:
+        await websocket.close(code=4403 if exc.status_code == 403 else 4401)
+    except (asyncio.TimeoutError, ValueError, TypeError, AttributeError):
+        await websocket.close(code=4401)
     except WebSocketDisconnect:
-        manager.disconnect(clerk_id)
+        pass
+    finally:
+        if user is not None:
+            manager.disconnect(websocket, user.user_id)
 
 # ==========================================
 # AUTOMATED DISASTER ALERT ENGINE
 # ==========================================
 def send_email_alert(to_email, subject, body):
-    if not to_email: return
+    if not to_email or not os.getenv("SMTP_EMAIL") or not os.getenv("SMTP_APP_PASSWORD"):
+        return False
     try:
-        print(f"\n[EMAIL DISPATCHED TO {to_email}]\nSUBJECT: {subject.encode('ascii', 'ignore').decode()}\nBODY: {body.encode('ascii', 'ignore').decode()}\n")
-    except Exception:
-        pass
-    try:
-        smtp_email = os.getenv("SMTP_EMAIL")
-        smtp_password = os.getenv("SMTP_APP_PASSWORD")
-        if not smtp_email or not smtp_password:
-            raise RuntimeError("SMTP_EMAIL / SMTP_APP_PASSWORD are not configured")
         msg = MIMEText(body, 'html', 'utf-8')
         msg['Subject'] = subject
-        msg['From'] = smtp_email
+        msg['From'] = os.environ["SMTP_EMAIL"]
         msg['To'] = to_email
-        with smtplib.SMTP(os.getenv("SMTP_HOST", "smtp.gmail.com"), int(os.getenv("SMTP_PORT", "587"))) as server:
-            server.starttls()
-            server.login(smtp_email, smtp_password)
+        with smtplib.SMTP(os.getenv("SMTP_HOST", "smtp.gmail.com"), int(os.getenv("SMTP_PORT", "587")), timeout=10) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(os.environ["SMTP_EMAIL"], os.environ["SMTP_APP_PASSWORD"])
             server.send_message(msg)
-    except Exception as e:
-        print(f"Failed to send email to {to_email}: {e}")
+        return True
+    except Exception:
+        logger.warning("Email delivery failed")
+        return False
 
-def send_sms_alert(to_phone, body):
-    if not to_phone: return
-    print(f"\n[SMS DISPATCHED TO {to_phone}]\nBODY: {body}\n")
-    # For production: Add Twilio or Fast2SMS API integration here
 
 def send_web_push(subscription_info, title, body):
-    if not subscription_info: return
+    if not subscription_info or not public_push_key():
+        return False
     try:
+        subscription = validate_push_subscription(subscription_info)
         from pywebpush import webpush
-        import json
-        webpush(
-            subscription_info=subscription_info,
-            data=json.dumps({"title": title, "body": body, "url": "/"}),
-            vapid_private_key="private_key.pem",
-            vapid_claims={"sub": "mailto:admin@vyom.gov.in"}
-        )
-        print("Web Push sent successfully.")
-    except Exception as e:
-        print("Failed to send Web Push:", e)
-
-def scan_and_alert_users():
-    """Background task that scans all users for upcoming natural calamities using forecasting and web search."""
-    import time
-    if users_collection is None: return
-    
-    users = users_collection.find({"alert_enabled": True, "alert_lat": {"$ne": None}, "alert_lon": {"$ne": None}})
-    
-    for user in users:
-        lat, lon = user.get("alert_lat"), user.get("alert_lon")
-        email = user.get("alert_email") or user.get("email")
-        phone = user.get("phone")
-        lang, persona = user.get("language", "English"), user.get("persona", "General Citizen")
-        last_alert_time = user.get("last_alert_time", 0)
-        
-        # Cooldown check: 12 hours (43200 seconds)
-        if time.time() - last_alert_time < 43200:
-            continue
-            
-        rain_thresh = float(user.get("alert_rain_threshold", 50.0))
-        heat_thresh = float(user.get("alert_heat_threshold", 42.0))
-        wind_thresh = float(user.get("alert_wind_threshold", 60.0))
-        
-        calamity = None
-        calamity_details = ""
-        
-        # 1. Forecast-based Hazard Detection (next 72h)
-        weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,precipitation,wind_speed_10m,weather_code&forecast_days=3&timezone=auto"
-        try:
-            import requests
-            res = requests.get(weather_url, timeout=5).json()
-            hourly = res.get("hourly", {})
-            temps = hourly.get("temperature_2m", [])
-            precips = hourly.get("precipitation", [])
-            winds = hourly.get("wind_speed_10m", [])
-            codes = hourly.get("weather_code", [])
-            times = hourly.get("time", [])
-            
-            for i in range(len(temps)):
-                t = temps[i]
-                p = precips[i]
-                w = winds[i]
-                c = codes[i]
-                time_str = times[i]
-                
-                # Check for sustained heat (3 consecutive hours)
-                if i >= 2 and t and temps[i-1] and temps[i-2] and t >= heat_thresh and temps[i-1] >= heat_thresh and temps[i-2] >= heat_thresh:
-                    calamity = f"Extreme Heat expected around {time_str}"
-                    break
-                # Wind check
-                elif w and w >= wind_thresh:
-                    calamity = f"Destructive Winds expected around {time_str}"
-                    break
-                # Rolling rain sum (3 hours)
-                elif i >= 2 and p is not None and sum([precips[i] or 0, precips[i-1] or 0, precips[i-2] or 0]) >= rain_thresh:
-                    calamity = f"Heavy Rainfall/Flood Risk expected around {time_str}"
-                    break
-                # Thunderstorms/Blizzard
-                elif c in [95, 96, 99]:
-                    calamity = f"Severe Thunderstorm expected around {time_str}"
-                    break
-                elif c in [75, 77, 86] and p and p > 15:
-                    calamity = f"Heavy Blizzard Risk expected around {time_str}"
-                    break
-        except Exception as e:
-            print(f"Forecast scan failed for user {email}: {e}")
-
-        # 2. Web Search for Impending Calamities (Cyclone, Flood)
-        if not calamity:
-            try:
-                # Get city name
-                rev_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=10"
-                rev_res = requests.get(rev_url, headers={'User-Agent': 'Vyom'}, timeout=5).json()
-                address = rev_res.get("address", {})
-                city = address.get("city") or address.get("state") or address.get("country", "")
-                
-                if city:
-                    import datetime
-                    current_year = datetime.datetime.now().year
-                    current_date = datetime.datetime.now().strftime("%Y-%m-%d")
-                    
-                    search_query = f"{city} {current_year} upcoming natural calamity cyclone hurricane flood earthquake warning next 48 hours"
-                    from ddgs import DDGS
-                    results = DDGS().text(search_query, max_results=3)
-                    if results:
-                        combined_text = " ".join([r.get('body', '') for r in results])
-                        ai_check_prompt = f"Today's date is {current_date}. Analyze these search results: '{combined_text}'. Are any of these results indicating a CONFIRMED natural calamity (cyclone, flood, etc.) for {city} that is upcoming strictly in the next 48 hours FROM TODAY? Ignore old historical events from previous years. Reply with strictly 'YES: [calamity name]' or 'NO'."
-                        ai_check = safe_ai_completion([{"role": "user", "content": ai_check_prompt}], temp=0.1)
-                        if "YES:" in ai_check.upper():
-                            calamity = ai_check.split(":", 1)[1].strip()
-                            calamity_details = combined_text
-            except Exception as e:
-                print(f"Web search scan failed: {e}")
-
-        # 3. USGS Earthquake Detection
-        if not calamity:
-            try:
-                usgs_url = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson"
-                eq_data = requests.get(usgs_url, timeout=5).json()
-                for feature in eq_data.get("features", []):
-                    coords = feature["geometry"]["coordinates"]
-                    eq_lon, eq_lat = coords[0], coords[1]
-                    mag = feature["properties"]["mag"]
-                    tsunami = feature["properties"]["tsunami"]
-                    
-                    dist_km = (((lat - eq_lat)**2 + (lon - eq_lon)**2)**0.5) * 111
-                    
-                    if dist_km < 400 and tsunami == 1:
-                        calamity = f"Tsunami Warning (Triggered by Mag {mag} Earthquake)"
-                        break
-                    elif dist_km < 150 and mag >= 5.0:
-                        calamity = f"Strong Earthquake Alert (Mag {mag} nearby)"
-                        break
-            except Exception as eq_e:
-                print(f"Earthquake scan failed: {eq_e}")
-
-        if calamity:
-            prompt = f"""
-            URGENT: A {calamity} is predicted near the user's location (Lat: {lat}, Lon: {lon}).
-            Additional Context: {calamity_details}
-            
-            Write a detailed, life-saving emergency email for a {persona} in {lang}.
-            Include:
-            1. Details of the disaster and expected time to impact.
-            2. What to do immediately to prepare.
-            3. Suggest how far they need to move or directly suggest a safe place/action.
-            Format with clear headings. Do not include any pleasantries. Be authoritative.
-            FORMATTING RULES: You must output STRICTLY IN VALID HTML. Use <h2>, <ul>, <li>, <strong>, and <br> to make it highly readable and professionally formatted. Do NOT use Markdown (no **). Do NOT wrap your response in ```html ``` blocks.
-            """
-            alert_message = safe_ai_completion([{"role": "user", "content": prompt}], temp=0.2)
-            
-            subject = f"⚠️ VYOM PREDICTIVE ALERT: {calamity.upper()}"
-            send_email_alert(email, subject, alert_message)
-            send_sms_alert(phone, f"VYOM ALERT: {calamity}. Check your email immediately for evacuation and safety instructions.")
-            
-            push_sub = user.get("push_subscription")
-            if push_sub:
-                send_web_push(push_sub, subject, f"Emergency: {calamity}. Click to open Vyom AI for full advisory.")
-            
-            clerk_id = user.get("clerk_id")
-            if clerk_id and global_loop:
-                import json
-                ws_msg = json.dumps({"type": "disaster_alert", "calamity": calamity, "message": alert_message})
-                try:
-                    asyncio.run_coroutine_threadsafe(manager.send_personal_message(ws_msg, clerk_id), global_loop)
-                except Exception as ws_err:
-                    print(f"WebSocket push failed: {ws_err}")
-            
-            # --- START DISASTER AGENCY NOTIFICATION ---
-            try:
-                # Do not alert agencies for extreme heat
-                if "heat" not in calamity.lower():
-                    # Always fetch full address to get hierarchy for search radius
-                    rev_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&zoom=10"
-                    try:
-                        import requests
-                        rev_res = requests.get(rev_url, headers={'User-Agent': 'Vyom'}, timeout=5).json()
-                        address = rev_res.get("address", {})
-                        loc_city = address.get("city") or address.get("town") or address.get("village")
-                        loc_district = address.get("state_district") or address.get("county")
-                        loc_state = address.get("state")
-                        
-                        search_areas = []
-                        if loc_city: search_areas.append(loc_city)
-                        if loc_district and loc_district != loc_city: search_areas.append(loc_district)
-                        if loc_state and loc_state != loc_district and loc_state != loc_city: search_areas.append(loc_state)
-                        if not search_areas:
-                            search_areas.append(f"{lat},{lon}")
-                    except Exception:
-                        search_areas = [city] if 'city' in locals() and city else [f"{lat},{lon}"]
-
-                    for search_area in search_areas:
-                        cache_key = f"{search_area}_{calamity}"
-                        if cache_key in agency_alert_cache and time.time() - agency_alert_cache[cache_key] <= 43200:
-                            break # Already alerted this or broader area recently
-                        
-                        print(f"Searching for disaster agencies in {search_area}...")
-                        agency_search_query = f'"{search_area}" disaster management rescue team official contact email address "gov.in" OR "nic.in" OR ".gov"'
-                        from ddgs import DDGS
-                        agency_results = DDGS().text(agency_search_query, max_results=5)
-                        
-                        agency_emails = []
-                        if agency_results:
-                            agency_combined_text = " ".join([r.get('body', '') for r in agency_results])
-                            email_extraction_prompt = f"Extract all official email addresses of disaster management, police, or rescue agencies from the following text related to {search_area}. STRICTLY INCLUDE ONLY official domains like .gov.in, .nic.in, .gov, .org, or official municipality domains. EXCLUDE all personal domains like @gmail.com, @hotmail.com, @yahoo.com, etc. Return ONLY a comma-separated list of valid email addresses. If you cannot find any matching these criteria, return exactly 'NONE'. Text: {agency_combined_text}"
-                            extracted_emails = safe_ai_completion([{"role": "user", "content": email_extraction_prompt}], temp=0.1)
-                            
-                            if extracted_emails and "NONE" not in extracted_emails.upper():
-                                candidates = [e.strip() for e in extracted_emails.split(",") if "@" in e]
-                                for e in candidates:
-                                    domain = e.split("@")[-1].lower()
-                                    if domain not in ["gmail.com", "hotmail.com", "yahoo.com", "outlook.com", "rediffmail.com", "live.com", "icloud.com"]:
-                                        agency_emails.append(e)
-                                        
-                        if agency_emails:
-                            agency_alert_cache[cache_key] = time.time()
-                            print(f"Found official agency emails for {search_area}: {agency_emails}")
-                            agency_subject = f"URGENT: DISASTER PREDICTION FOR {search_area.upper()} - {calamity.upper()}"
-                            agency_message = f"""
-                            <h2>Automated Early Warning Notification</h2>
-                            <p>This is an automated priority alert from the Vyom Predictive System.</p>
-                            <p>A <strong>{calamity}</strong> is predicted to impact the vicinity of {search_area} (Lat: {lat}, Lon: {lon}).</p>
-                            <h3>Calamity Details & Context:</h3>
-                            <p>{calamity_details or 'Severe weather/hazard conditions have breached critical thresholds in your jurisdiction.'}</p>
-                            <h3>Required Action:</h3>
-                            <p>We are forwarding this automated telemetry to inform your agency to initiate potential search, rescue, or preparatory evacuation protocols in the affected area.</p>
-                            <p><i>Vyom Automated Early Warning System</i></p>
-                            """
-                            for a_email in agency_emails:
-                                send_email_alert(a_email, agency_subject, agency_message)
-                            break # Found emails for this level, stop expanding radius
-            except Exception as agency_err:
-                print(f"Agency notification failed: {agency_err}")
-            # --- END DISASTER AGENCY NOTIFICATION ---
-            
-            # Update cooldown
-            users_collection.update_one({"_id": user["_id"]}, {"$set": {"last_alert_time": time.time(), "last_alert_calamity": calamity}})
+        webpush(subscription_info=subscription,
+                data=json.dumps({"title": title, "body": body[:2000], "url": "/"}),
+                vapid_private_key=os.environ["VAPID_PRIVATE_KEY_PATH"],
+                vapid_claims={"sub": os.environ["VAPID_SUBJECT"]}, timeout=10)
+        return True
+    except Exception:
+        logger.warning("Web push delivery failed")
+        return False
 
 
-@app.post("/api/alerts/trigger")
+def _send_live_alert(user_id, event):
+    if global_loop is None or not global_loop.is_running():
+        return False
+    message = json.dumps({"type": "disaster_alert", "calamity": event.title,
+                          "message": event.text, "event_id": event.event_id, "source": event.source})
+    future = asyncio.run_coroutine_threadsafe(manager.send_personal_message(message, user_id), global_loop)
+    try:
+        return future.result(timeout=10)
+    except Exception:
+        future.cancel()
+        return False
+
+
+def scan_and_alert_users(user_id: Optional[str] = None):
+    scan_users(users_collection, alert_deliveries_collection, send_email_alert,
+               send_web_push, _send_live_alert, public_push_key(), user_id=user_id)
+
+
+@app.post("/api/alerts/trigger", dependencies=[Depends(require_admin)])
 def trigger_alert_scan(background_tasks: BackgroundTasks):
-    """Admin endpoint to manually trigger a sweep of all users for calamities."""
     background_tasks.add_task(scan_and_alert_users)
-    return {"status": "success", "message": "Disaster alert scan initiated in the background."}
+    return {"status": "success", "message": "Opted-in user alert scan initiated."}
 
 # ==========================================
 # STANDARD ROUTES
@@ -548,6 +406,11 @@ def trigger_alert_scan(background_tasks: BackgroundTasks):
 @app.get("/")
 def home():
     return FileResponse("index.html", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"})
+
+@app.get("/api/push/public-key")
+def get_push_public_key():
+    return {"public_key": public_push_key()}
+
 
 @app.get("/manifest.json")
 def get_manifest():
@@ -745,8 +608,8 @@ class MarineVesselRequest(BaseModel):
 
 
 class MarineAdvisoryRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     vessel: Optional[MarineVesselRequest] = None
     horizon_hours: int = 120
     scenario_count: int = 80
@@ -755,8 +618,8 @@ class MarineAdvisoryRequest(BaseModel):
 
 
 class MarineDataCollectRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     vessel: Optional[MarineVesselRequest] = None
     run_calibration: bool = True
 
@@ -766,8 +629,8 @@ class VesselCalibrationCaseRequest(BaseModel):
     vessel_id: str
     vessel_class: str
     occurred_at: str
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     event_type: str
     outcome: int
     predicted_probability: float
@@ -810,8 +673,8 @@ class AviationAircraftRequest(BaseModel):
 
 
 class AviationAdvisoryRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     aircraft: Optional[AviationAircraftRequest] = None
     horizon_hours: int = 72
     scenario_count: int = 120
@@ -833,8 +696,8 @@ class AdventureActivityRequest(BaseModel):
 
 
 class AdventureAdvisoryRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     activity: Optional[AdventureActivityRequest] = None
     horizon_hours: int = 72
     scenario_count: int = 120
@@ -868,8 +731,8 @@ class DisasterContextRequest(BaseModel):
 
 
 class DisasterAdvisoryRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     context: Optional[DisasterContextRequest] = None
     horizon_hours: int = 120
     scenario_count: int = 160
@@ -905,8 +768,8 @@ def preview_router(payload: RouterPreviewRequest):
 
 
 class AgroAdvisoryRequest(BaseModel):
-    lat: float
-    lon: float
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
     field: Optional[AgroFieldRequest] = None
     horizon_hours: int = 120
     scenario_count: int = 64
@@ -964,7 +827,9 @@ def save_persisted_agro_state(clerk_id: Optional[str], field_id: Optional[str], 
 
 
 @app.post("/agro/advisory")
-async def standalone_agro_advisory(req: AgroAdvisoryRequest):
+async def standalone_agro_advisory(req: AgroAdvisoryRequest, user: Optional[AuthenticatedUser] = Depends(optional_user)):
+    user_id = owned_user_id(req.clerk_id, user)
+    req = req.model_copy(update={"clerk_id": user_id})
     field_cfg = req.field.dict(exclude_none=True) if req.field else {}
     field_id = field_cfg.get("field_id")
     # Database state is only a prior. A fresh root-zone observation supplied in
@@ -1045,7 +910,9 @@ def save_persisted_marine_state(clerk_id: Optional[str], vessel_id: Optional[str
 
 
 @app.post("/marine/advisory")
-async def standalone_marine_advisory(req: MarineAdvisoryRequest):
+async def standalone_marine_advisory(req: MarineAdvisoryRequest, user: Optional[AuthenticatedUser] = Depends(optional_user)):
+    user_id = owned_user_id(req.clerk_id, user)
+    req = req.model_copy(update={"clerk_id": user_id})
     vessel_cfg = req.vessel.dict(exclude_none=True) if req.vessel else {}
     vessel_id = vessel_cfg.get("vessel_id")
     vessel_cfg.update(load_persisted_marine_state(req.clerk_id, vessel_id))
@@ -1075,7 +942,7 @@ async def standalone_marine_advisory(req: MarineAdvisoryRequest):
         }
 
 
-@app.get("/marine/data/health")
+@app.get("/marine/data/health", dependencies=[Depends(require_admin)])
 async def marine_data_health():
     """Real-feed/data-fabric health and record counts."""
     try:
@@ -1084,7 +951,7 @@ async def marine_data_health():
         return {"status":"error","reason":str(e)}
 
 
-@app.post("/marine/data/collect")
+@app.post("/marine/data/collect", dependencies=[Depends(require_admin)])
 async def marine_data_collect(req: MarineDataCollectRequest):
     """Collect configured authoritative/observational feeds for one ocean point."""
     svc = MarineRealtimeService()
@@ -1098,7 +965,7 @@ async def marine_data_collect(req: MarineDataCollectRequest):
         return {"status":"error","reason":str(e)}
 
 
-@app.post("/marine/data/calibrate")
+@app.post("/marine/data/calibrate", dependencies=[Depends(require_admin)])
 async def marine_data_calibrate(lookback_days: int = 10):
     """Match stored forecasts to observations and recompute calibration cells."""
     try:
@@ -1106,16 +973,13 @@ async def marine_data_calibrate(lookback_days: int = 10):
     except Exception as e:
         return {"status":"error","reason":str(e)}
 
-@app.post("/marine/data/vessel-case")
-async def marine_vessel_calibration_case(req: VesselCalibrationCaseRequest, x_vyom_admin_token: Optional[str] = Header(None)):
+@app.post("/marine/data/vessel-case", dependencies=[Depends(require_admin)])
+async def marine_vessel_calibration_case(req: VesselCalibrationCaseRequest):
     """Store an explicitly verified event/control label for vessel-response calibration.
 
     This endpoint is admin-gated because false labels can corrupt safety calibration.
     Set VYOM_ADMIN_TOKEN in .env and send it as X-VYOM-Admin-Token.
     """
-    expected = os.getenv("VYOM_ADMIN_TOKEN", "")
-    if not expected or x_vyom_admin_token != expected:
-        raise HTTPException(status_code=403, detail="Admin token required")
     svc = MarineRealtimeService()
     ok = svc.fabric.log_vessel_labeled_case(
         req.case_id, req.vessel_id, req.vessel_class, req.occurred_at, req.lat, req.lon,
@@ -1134,14 +998,14 @@ async def standalone_aviation_advisory(req: AviationAdvisoryRequest):
     except Exception as e:
         return {"engine":"VYOM-AVIATION","version":"1.1.0","status":"error","reason":str(e),"risk":{},"confidence":{"overall":0.0},"dispatch_clearance":None}
 
-@app.get("/aviation/data/health")
+@app.get("/aviation/data/health", dependencies=[Depends(require_admin)])
 async def aviation_data_health():
     try:
         return await run_in_threadpool(AviationRealtimeService().health)
     except Exception as e:
         return {"status":"error","reason":str(e)}
 
-@app.post("/aviation/data/calibrate")
+@app.post("/aviation/data/calibrate", dependencies=[Depends(require_admin)])
 async def aviation_data_calibrate(lookback_days: int = 30):
     try:
         return await run_in_threadpool(AviationRealtimeService().verify_and_calibrate, max(1,min(365,lookback_days)))
@@ -1157,14 +1021,14 @@ async def standalone_adventure_advisory(req: AdventureAdvisoryRequest):
     except Exception as e:
         return {"engine":"VYOM-ADVENTURE","version":"1.0.0","status":"error","reason":str(e),"risk":{},"confidence":{"overall":0.0},"safe_to_proceed":None}
 
-@app.get("/adventure/data/health")
+@app.get("/adventure/data/health", dependencies=[Depends(require_admin)])
 async def adventure_data_health():
     try:
         return await run_in_threadpool(AdventureRealtimeService().health)
     except Exception as e:
         return {"status":"error","reason":str(e)}
 
-@app.post("/adventure/data/calibrate")
+@app.post("/adventure/data/calibrate", dependencies=[Depends(require_admin)])
 async def adventure_data_calibrate(lookback_days: int = 30):
     try:
         return await run_in_threadpool(AdventureRealtimeService().verify_and_calibrate, max(1,min(365,lookback_days)))
@@ -1210,7 +1074,7 @@ async def standalone_disaster_advisory(req: DisasterAdvisoryRequest):
         return {"engine":"VYOM-RAKSHA","version":"1.0.0","status":"error","reason":str(e),"risk":{},"confidence":{"overall":0.0},"evacuation_order":None,"all_clear":None}
 
 
-@app.get("/disaster/data/health")
+@app.get("/disaster/data/health", dependencies=[Depends(require_admin)])
 async def disaster_data_health():
     try:
         return await run_in_threadpool(DisasterRealtimeService().health)
@@ -1218,7 +1082,7 @@ async def disaster_data_health():
         return {"status":"error","reason":str(e)}
 
 
-@app.post("/disaster/data/calibrate")
+@app.post("/disaster/data/calibrate", dependencies=[Depends(require_admin)])
 async def disaster_data_calibrate(lookback_days: int = 30):
     try:
         return await run_in_threadpool(DisasterRealtimeService().verify_and_calibrate, max(1,min(365,lookback_days)))
@@ -1529,7 +1393,9 @@ async def process_route_weather(origin_str, dest_str, query, language, persona, 
         return {"weather_report": f"Error calculating route weather: {str(e)}", "weather_code": 0, "telemetry": {}}
 
 @app.post("/weather")
-async def post_live_weather(req: WeatherRequest):
+async def post_live_weather(req: WeatherRequest, user: Optional[AuthenticatedUser] = Depends(optional_user)):
+    user_id = owned_user_id(req.clerk_id, user)
+    req = req.model_copy(update={"clerk_id": user_id})
     query = req.query
     lat = req.lat
     lon = req.lon
@@ -1543,7 +1409,7 @@ async def post_live_weather(req: WeatherRequest):
     history = req.history
 
     try:
-        headers = {'User-Agent': 'MoES-WeatherGPT/1.0'}
+        headers = {'User-Agent': 'VYOM/1.0'}
         city_name = "the selected location"
 
         # Specialized corridor intent must override an automatically attached current
@@ -1923,7 +1789,7 @@ Return exactly ROUTE: Origin | Destination if both are explicit. Otherwise retur
             active_guideline = "CRITICAL: High-altitude environmental exposure. Use conservative cold, wind, weather and altitude-risk screening; do not encourage technical or hazardous travel."
 
         messages = [
-            {"role": "system", "content": f"You are WeatherGPT, an authoritative meteorological decision AI for India's Ministry of Earth Sciences.\n\nMANDATORY RULES:\n1. STRICT LANGUAGE ENFORCEMENT: Answer in {language}.\n2. PHYSICS OVERRIDE: If temp < 0°C, interpret precipitation as snow/ice.\n3. SEVERE WEATHER ALERT: If severe, start with [ALERT: <Urgent warning>]\n4. Direct Answer: Mention {city_name} in sentence 1.\n5. WEATHER ONLY: NEVER provide history, political data, or general geographic facts about the place. ONLY discuss the current and forecasted weather conditions, telemetry, and actionable advice.\n6. AIR QUALITY WARNINGS: If PM2.5, PM10, or UV Index in Current Telemetry's aqi field is high, and the user's Biometric Profile is 'Asthma / Respiratory', prioritize targeted severe health warnings for their airways. Include AQI context if relevant to the profile or persona (e.g. urban environments).\n7. MARINE DECISION CONTRACT: If Target Stakeholder is 'Marine/Fisherman', use ONLY structured VYOM-MARINE/Ocean Guardian-X telemetry for marine risk. Never recompute vessel safety from raw wave height alone. Keep risk and confidence separate. NEVER say a vessel is 'safe to sail', never invent a navigation clearance, never downgrade an official warning, and never convert generic model sea-level/current fields into coastal navigation or under-keel-clearance advice. Discuss CPA/TCPA, UKC, cyclone, sea-ice, route, RAO or extreme-wave outputs only when the engine marks that module available and the required trusted inputs were supplied. Explain screening risks rather than issuing helm/course commands.\n8. AGRO DECISION CONTRACT: If Target Stakeholder is 'Farmer', use ONLY the structured VYOM-AGRO telemetry for crop/soil risk and irrigation decisions. NEVER recompute agronomy from raw ET0/rain. Keep risk and confidence separate. If irrigation.liters_per_acre_authoritative is null, DO NOT present any exact irrigation volume as authoritative; explain the returned planning range and what field data is missing. Never diagnose a crop disease or invent a pesticide/product/dose from generic disease-conducive weather.\n9. AVIATION DECISION CONTRACT: Aviation responses are handled by the dedicated VYOM VAYU guarded narrator and must not be regenerated from generic telemetry. Never issue or imply flight clearance.\n10. ADVENTURE DECISION CONTRACT: If Target Stakeholder is 'Adventurer', use ONLY structured VYOM-ADVENTURE telemetry for outdoor environmental risk. Never certify a route or activity as safe, and never provide operational instructions for technical climbing, avalanche travel, river crossings, wildfire escape, or other hazardous maneuvers. Treat official local warnings and avalanche/land-management bulletins as higher priority than model output. Keep risk, confidence and data quality separate.\n11. DISASTER DECISION CONTRACT: If Target Stakeholder is 'Disaster Management', use ONLY structured VYOM-RAKSHA telemetry for multi-hazard assessment. Official CAP/agency warnings and evacuation/all-clear orders always outrank model output. Never invent an evacuation order, shelter selection, rescue dispatch, all-clear, earthquake prediction or tsunami evacuation decision. Treat USGS/GDACS/FIRMS/GloFAS/model outputs as context with their documented limitations, keep hazard probability, impact risk, confidence and data quality separate, and state when local exposure, terrain, gauge or authority information is missing.\n12. NO CLUTTER: Provide a natural, conversational paragraph. NEVER output large Markdown tables, hour-by-hour forecast lists, or verbose bullet structures unless explicitly requested by the user."}
+            {"role": "system", "content": f"You are VYOM's explanation layer for weather decision support. Distinguish model forecasts from observations and official authority bulletins.\n\nMANDATORY RULES:\n1. STRICT LANGUAGE ENFORCEMENT: Answer in {language}.\n2. PHYSICS OVERRIDE: If temp < 0°C, interpret precipitation as snow/ice.\n3. SEVERE WEATHER ALERT: If severe, start with [ALERT: <Urgent warning>]\n4. Direct Answer: Mention {city_name} in sentence 1.\n5. WEATHER ONLY: NEVER provide history, political data, or general geographic facts about the place. ONLY discuss the current and forecasted weather conditions, telemetry, and actionable advice.\n6. AIR QUALITY WARNINGS: If PM2.5, PM10, or UV Index in Current Telemetry's aqi field is high, and the user's Biometric Profile is 'Asthma / Respiratory', prioritize targeted severe health warnings for their airways. Include AQI context if relevant to the profile or persona (e.g. urban environments).\n7. MARINE DECISION CONTRACT: If Target Stakeholder is 'Marine/Fisherman', use ONLY structured VYOM-MARINE/Ocean Guardian-X telemetry for marine risk. Never recompute vessel safety from raw wave height alone. Keep risk and confidence separate. NEVER say a vessel is 'safe to sail', never invent a navigation clearance, never downgrade an official warning, and never convert generic model sea-level/current fields into coastal navigation or under-keel-clearance advice. Discuss CPA/TCPA, UKC, cyclone, sea-ice, route, RAO or extreme-wave outputs only when the engine marks that module available and the required trusted inputs were supplied. Explain screening risks rather than issuing helm/course commands.\n8. AGRO DECISION CONTRACT: If Target Stakeholder is 'Farmer', use ONLY the structured VYOM-AGRO telemetry for crop/soil risk and irrigation decisions. NEVER recompute agronomy from raw ET0/rain. Keep risk and confidence separate. If irrigation.liters_per_acre_authoritative is null, DO NOT present any exact irrigation volume as authoritative; explain the returned planning range and what field data is missing. Never diagnose a crop disease or invent a pesticide/product/dose from generic disease-conducive weather.\n9. AVIATION DECISION CONTRACT: Aviation responses are handled by the dedicated VYOM VAYU guarded narrator and must not be regenerated from generic telemetry. Never issue or imply flight clearance.\n10. ADVENTURE DECISION CONTRACT: If Target Stakeholder is 'Adventurer', use ONLY structured VYOM-ADVENTURE telemetry for outdoor environmental risk. Never certify a route or activity as safe, and never provide operational instructions for technical climbing, avalanche travel, river crossings, wildfire escape, or other hazardous maneuvers. Treat official local warnings and avalanche/land-management bulletins as higher priority than model output. Keep risk, confidence and data quality separate.\n11. DISASTER DECISION CONTRACT: If Target Stakeholder is 'Disaster Management', use ONLY structured VYOM-RAKSHA telemetry for multi-hazard assessment. Official CAP/agency warnings and evacuation/all-clear orders always outrank model output. Never invent an evacuation order, shelter selection, rescue dispatch, all-clear, earthquake prediction or tsunami evacuation decision. Treat USGS/GDACS/FIRMS/GloFAS/model outputs as context with their documented limitations, keep hazard probability, impact risk, confidence and data quality separate, and state when local exposure, terrain, gauge or authority information is missing.\n12. NO CLUTTER: Provide a natural, conversational paragraph. NEVER output large Markdown tables, hour-by-hour forecast lists, or verbose bullet structures unless explicitly requested by the user."}
         ]
         
         for msg in history[-4:]:
@@ -2037,8 +1903,8 @@ def generate_executive_pdf(
     heading_style = ParagraphStyle('HeadingStyle', parent=styles['Heading2'], fontSize=10.5, textColor=colors.HexColor('#0d9488'), spaceBefore=10, spaceAfter=4, fontName=font_bold)
     body_style = ParagraphStyle('BodyStyle', parent=styles['Normal'], fontSize=8.5, textColor=colors.HexColor('#334155'), spaceAfter=6, leading=12, fontName=font_regular)
 
-    story.append(Paragraph("MINISTRY OF EARTH SCIENCES (MoES) — OFFICIAL METEOROLOGICAL BRIEF", title_style))
-    story.append(Paragraph(f"Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Classification: RESTRICTED", subtitle_style))
+    story.append(Paragraph("VYOM — WEATHER DECISION-SUPPORT BRIEF", title_style))
+    story.append(Paragraph(f"Timestamp: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | VYOM decision support", subtitle_style))
     story.append(Spacer(1, 2))
 
     story.append(Paragraph("1. TARGET LOCATION & TOPOGRAPHY", heading_style))
@@ -2062,7 +1928,7 @@ def generate_executive_pdf(
     story.append(t2)
     story.append(Spacer(1, 6))
 
-    story.append(Paragraph(f"3. OFFICIAL STAKEHOLDER ADVISORY", heading_style))
+    story.append(Paragraph(f"3. VYOM STAKEHOLDER ADVISORY", heading_style))
     
     # Clean markdown and problematic characters
     clean_report = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', report) # Bold
@@ -2075,7 +1941,7 @@ def generate_executive_pdf(
 
     doc.build(story)
     pdf_buffer.seek(0)
-    return StreamingResponse(pdf_buffer, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=MoES_Briefing_{location.replace(' ', '_')}.pdf"})
+    return StreamingResponse(pdf_buffer, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=VYOM_Briefing_{location.replace(' ', '_')}.pdf"})
 
 VOICE_MAPPING = {
     "English": "en-IN-NeerjaExpressiveNeural", 

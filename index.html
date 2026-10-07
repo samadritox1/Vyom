@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vyom - MoES AI</title>
+    <title>Vyom — Weather Decision Support</title>
     <link rel="manifest" href="/manifest.json">
     
     <!-- SF Pro Equivalent Web Font (Inter) for Windows/Linux -->
@@ -2413,13 +2413,16 @@
         </button>
         <h2 style="margin-top: 0; margin-bottom: 12px; font-size: 1.8rem; font-weight: 700; letter-spacing: -0.02em; color: var(--text-main);">Automated Alerts</h2>
         <p style="color: var(--text-muted); font-size: 0.95rem; margin-bottom: 24px; line-height: 1.5;">
-            Vyom can monitor this location in the background and email you when configured dangerous conditions are detected.
+            Receive official bulletins for this location and model forecast advisories when your thresholds are reached. Use an email verified on your account.
         </p>
         
         <div id="alertStatusBanner" class="modal-glass" style="display: none; padding: 12px 16px; border-radius: 12px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #10b981; font-size: 0.9rem; margin-bottom: 20px; align-items: center; gap: 8px;">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
             Monitoring is active for this location.
         </div>
+        <p id="alertRenewalNotice" role="status" style="display: none; color: var(--text-muted); font-size: 0.9rem; line-height: 1.5;">
+            Please review your email and location, then enable alerts again to confirm these settings.
+        </p>
 
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px;">
             <div style="grid-column: span 1;">
@@ -2435,7 +2438,7 @@
                 <input type="number" step="any" id="alertLon" class="input-glass" style="width: 100%; padding: 12px 16px; border-radius: 12px; color: var(--text-main); font-family: inherit; font-size: 0.95rem; outline: none;">
             </div>
             <div style="grid-column: span 1;">
-                <label style="display: block; font-size: 0.75rem; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em;">Rain Threshold (mm/24h)</label>
+                <label style="display: block; font-size: 0.75rem; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em;">Rain Threshold (mm/3h)</label>
                 <input type="number" step="any" id="alertRain" value="50" class="input-glass" style="width: 100%; padding: 12px 16px; border-radius: 12px; color: var(--text-main); font-family: inherit; font-size: 0.95rem; outline: none;">
             </div>
             <div style="grid-column: span 1;">
@@ -2713,7 +2716,7 @@
 </div>
 
 <script>
-    const PUBLIC_VAPID_KEY = "BA8bfxTNaXfw5CyjxhWbLsCeRH3mBAcIlkvx-YkW5FhwB1yWGgj36nGQJD087tDN_5mpzYrZ6vHdkU7cPNbAkOE";
+
 
     function urlB64ToUint8Array(base64String) {
         const padding = '='.repeat((4 - base64String.length % 4) % 4);
@@ -4168,11 +4171,17 @@
                 payload.lon = geoCoords.lon;
             }
 
+            const requestHeaders = { "Content-Type": "application/json" };
+            if (currentClerkUser && window.Clerk.session) {
+                const sessionToken = await window.Clerk.session.getToken();
+                if (sessionToken) requestHeaders.Authorization = `Bearer ${sessionToken}`;
+            }
             const res = await fetch("/weather", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: requestHeaders,
                 body: JSON.stringify(payload)
             });
+            if (!res.ok) throw new Error("Weather request failed; sign in again if your session expired.");
             const data = await res.json();
             
             clearTimeout(loadingInterval);
@@ -4812,6 +4821,7 @@
                     initWebSocket(user.id);
                 } else {
                     currentClerkUser = null;
+                    if (window.activeWebSocket) window.activeWebSocket.close();
                     authGate.classList.remove("unlocked");
                     
                     if (!isSignInMounted) {
@@ -4852,6 +4862,20 @@
         const ws = new WebSocket(wsUrl);
         window.activeWebSocket = ws;
         
+        ws.onopen = async function() {
+            try {
+                if (!currentClerkUser || currentClerkUser.id !== clerkId || !window.Clerk.session) {
+                    ws.close();
+                    return;
+                }
+                const token = await window.Clerk.session.getToken();
+                if (!token || ws.readyState !== WebSocket.OPEN) { ws.close(); return; }
+                ws.send(JSON.stringify({ token }));
+            } catch (_) {
+                ws.close();
+            }
+        };
+
         ws.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
@@ -4864,8 +4888,9 @@
         };
         
         ws.onclose = function() {
+            if (window.activeWebSocket !== ws) return;
             setTimeout(() => {
-                if (currentClerkUser) {
+                if (currentClerkUser && window.activeWebSocket === ws) {
                     initWebSocket(currentClerkUser.id);
                 }
             }, 5000);
@@ -4889,10 +4914,14 @@
         
         const contentDiv = document.createElement("div");
         contentDiv.className = "message-content";
-        contentDiv.innerHTML = `<div class="weather-alert-box" style="margin-bottom: 15px;">
-            <span class="weather-alert-icon">⚠️</span>
-            <span>CRITICAL DISASTER ALERT: ${calamity}</span>
-        </div>${message}`;
+        const alertBanner = document.createElement("div");
+        alertBanner.className = "weather-alert-box";
+        alertBanner.style.marginBottom = "15px";
+        alertBanner.textContent = `VYOM Alert: ${calamity}`;
+        const alertBody = document.createElement("div");
+        alertBody.style.whiteSpace = "pre-line";
+        alertBody.textContent = message;
+        contentDiv.append(alertBanner, alertBody);
         
         msgDiv.appendChild(roleDiv);
         msgDiv.appendChild(contentDiv);
@@ -4925,8 +4954,8 @@
 
         // Also map alert configs if they exist
         if (profile.alert_email) document.getElementById('alertEmail').value = profile.alert_email;
-        if (profile.alert_lat) document.getElementById('alertLat').value = profile.alert_lat;
-        if (profile.alert_lon) document.getElementById('alertLon').value = profile.alert_lon;
+        if (profile.alert_lat != null) document.getElementById('alertLat').value = profile.alert_lat;
+        if (profile.alert_lon != null) document.getElementById('alertLon').value = profile.alert_lon;
         if (profile.alert_rain_threshold) document.getElementById('alertRain').value = profile.alert_rain_threshold;
         if (profile.alert_heat_threshold) document.getElementById('alertHeat').value = profile.alert_heat_threshold;
         if (profile.alert_wind_threshold) document.getElementById('alertWind').value = profile.alert_wind_threshold;
@@ -4940,6 +4969,10 @@
         if (profile.saved_locations) {
             renderSavedLocations(profile.saved_locations);
         }
+        if (profile.alert_requires_renewal) {
+            document.getElementById('alertEmail').value = currentClerkUser?.primaryEmailAddress?.emailAddress || '';
+        }
+        document.getElementById('alertRenewalNotice').style.display = profile.alert_requires_renewal ? 'block' : 'none';
     }
 
     async function loadUserPreferences(clerkId) {
@@ -5172,15 +5205,15 @@
         const payload = {
             clerk_id: currentClerkUser.id,
             alert_email: document.getElementById('alertEmail').value,
-            alert_lat: parseFloat(document.getElementById('alertLat').value) || null,
-            alert_lon: parseFloat(document.getElementById('alertLon').value) || null,
+            alert_lat: document.getElementById('alertLat').value.trim() === '' ? null : Number(document.getElementById('alertLat').value),
+            alert_lon: document.getElementById('alertLon').value.trim() === '' ? null : Number(document.getElementById('alertLon').value),
             alert_rain_threshold: parseFloat(document.getElementById('alertRain').value) || 50,
             alert_heat_threshold: parseFloat(document.getElementById('alertHeat').value) || 42,
             alert_wind_threshold: parseFloat(document.getElementById('alertWind').value) || 60,
             alert_enabled: enabled
         };
 
-        if (enabled && (!payload.alert_lat || !payload.alert_lon)) {
+        if (enabled && (payload.alert_lat === null || payload.alert_lon === null || !Number.isFinite(payload.alert_lat) || !Number.isFinite(payload.alert_lon))) {
             alert("Please provide latitude and longitude.");
             return;
         }
@@ -5192,11 +5225,23 @@
         if (enabled && 'serviceWorker' in navigator && 'PushManager' in window) {
             try {
                 const swReg = await navigator.serviceWorker.ready;
-                const subscription = await swReg.pushManager.subscribe({
-                    userVisibleOnly: true,
-                    applicationServerKey: urlB64ToUint8Array(PUBLIC_VAPID_KEY)
-                });
-                payload.push_subscription = subscription;
+                const configResponse = await fetch('/api/push/public-key');
+                const config = configResponse.ok ? await configResponse.json() : {};
+                if (config.public_key) {
+                    const key = urlB64ToUint8Array(config.public_key);
+                    let subscription = await swReg.pushManager.getSubscription();
+                    const previousKey = subscription && subscription.options.applicationServerKey;
+                    if (subscription && (!previousKey ||
+                        Array.from(new Uint8Array(previousKey)).join(',') !== Array.from(key).join(','))) {
+                        await subscription.unsubscribe();
+                        subscription = null;
+                    }
+                    subscription = subscription || await swReg.pushManager.subscribe({
+                        userVisibleOnly: true,
+                        applicationServerKey: key
+                    });
+                    payload.push_subscription = subscription.toJSON();
+                }
             } catch (err) {
                 console.error("Failed to subscribe to Web Push:", err);
             }
@@ -5215,12 +5260,13 @@
             const data = await res.json();
             if (data.status === "success") {
                 document.getElementById('alertStatusBanner').style.display = enabled ? 'block' : 'none';
+                document.getElementById('alertRenewalNotice').style.display = 'none';
                 document.getElementById('alertDisableBtn').style.display = enabled ? 'inline-block' : 'none';
                 if (!enabled) {
                     setTimeout(() => closeAlertModal(), 800);
                 }
             } else {
-                alert("Failed to save config: " + data.message);
+                alert("Failed to save config: " + (data.detail || data.message || "Please sign in again."));
             }
         } catch(e) {
             alert("Error saving configuration.");

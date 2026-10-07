@@ -53,7 +53,7 @@ disaster_realtime_worker.py
 docs/
 ```
 
-No test files or example configuration/data files are included in this final package.
+Security regression tests are in `tests/`; `.env.example` lists the security configuration.
 
 ## Install
 
@@ -88,6 +88,20 @@ MONGO_URI
 ```
 
 See `ENVIRONMENT_VARIABLES.md` for the engine-specific optional variables.
+
+Personal data and alert configuration also require server-side Clerk verification.
+Follow [the security deployment guide](docs/SECURITY_DEPLOYMENT.md) to configure
+Clerk, administrator access, fresh push keys and renewed alert consent before deploying.
+
+## Security checks
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m pytest tests -q
+node --test tests/test_frontend.cjs
+```
+
+The tests do not send real notifications or access production databases.
 
 ## Run
 

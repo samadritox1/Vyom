@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
 import requests
+from cap_policy import parse_active_cap
+from alert_policy import utc_time
 
 UA = {"User-Agent": os.getenv("VYOM_USER_AGENT", "VYOM-Raksha/1.0 contact=admin@example.invalid")}
 
@@ -201,10 +203,24 @@ class NWSAlertsConnector:
         started=time.time()
         try:
             r=requests.get("https://api.weather.gov/alerts/active",params={"point":f"{lat},{lon}"},headers={**UA,"Accept":"application/geo+json"},timeout=12); r.raise_for_status(); warnings=[]
+            invalid = 0
+            now = datetime.now(timezone.utc)
             for f in r.json().get("features",[]):
                 p=f.get("properties") or {}
-                warnings.append({"source":"US NWS","event":p.get("event"),"severity":p.get("severity"),"certainty":p.get("certainty"),"urgency":p.get("urgency"),"headline":p.get("headline"),"description":p.get("description"),"instruction":p.get("instruction"),"effective":p.get("effective"),"expires":p.get("expires")})
-            return {"patch":{"official_warnings":warnings},"sources":[{"source":"US NWS","status":"ok","records":len(warnings)}],"elapsed_ms":round((time.time()-started)*1000,1)}
+                if not p.get("status") or not p.get("messageType"):
+                    invalid += 1
+                    continue
+                if p["status"] != "Actual" or p["messageType"] not in {"Alert", "Update"}:
+                    continue
+                effective, expires = utc_time(p.get("effective") or p.get("sent")), utc_time(p.get("expires"))
+                identifier = p.get("id") or f.get("id")
+                if not identifier or effective is None or expires is None or expires <= effective:
+                    invalid += 1
+                    continue
+                if not effective <= now < expires:
+                    continue
+                warnings.append({"source":"US NWS","identifier":identifier,"sent":p.get("sent"),"event":p.get("event"),"severity":p.get("severity"),"certainty":p.get("certainty"),"urgency":p.get("urgency"),"headline":p.get("headline"),"description":p.get("description"),"instruction":p.get("instruction"),"effective":effective.isoformat(),"expires":expires.isoformat(),"verified_for_location":True})
+            return {"patch":{"official_warnings":warnings},"sources":[{"source":"US NWS","status":"degraded" if invalid else "ok","records":len(warnings),"invalid_records":invalid}],"elapsed_ms":round((time.time()-started)*1000,1)}
         except Exception as exc:
             return {"patch":{},"sources":[{"source":"US NWS","status":"error","error":str(exc)}],"elapsed_ms":round((time.time()-started)*1000,1)}
 
@@ -222,13 +238,9 @@ class CAPFeedConnector:
         if not self.url: return {"patch":{},"sources":[{"source":"Configured CAP feed","status":"unconfigured","requires":"DISASTER_CAP_FEED_URL"}]}
         started=time.time()
         try:
-            r=requests.get(self.url,headers=UA,timeout=15); r.raise_for_status(); root=ET.fromstring(r.content); alerts=[]
-            roots=[root] if root.tag.split("}")[-1]=="alert" else [e for e in root.iter() if e.tag.split("}")[-1]=="alert"]
-            for a in roots:
-                identifier=self._text(a,"identifier"); sender=self._text(a,"sender"); sent=self._text(a,"sent")
-                for info in [e for e in list(a) if e.tag.split("}")[-1]=="info"]:
-                    alerts.append({"source":sender or "CAP authority","identifier":identifier,"sent":sent,"event":self._text(info,"event"),"severity":self._text(info,"severity"),"certainty":self._text(info,"certainty"),"urgency":self._text(info,"urgency"),"headline":self._text(info,"headline"),"description":self._text(info,"description"),"instruction":self._text(info,"instruction"),"effective":self._text(info,"effective"),"expires":self._text(info,"expires"),"cap":True})
-            return {"patch":{"official_warnings":alerts},"sources":[{"source":"Configured CAP feed","status":"ok","records":len(alerts)}],"elapsed_ms":round((time.time()-started)*1000,1)}
+            r=requests.get(self.url,headers=UA,timeout=15); r.raise_for_status()
+            alerts, invalid = parse_active_cap(r.content, lat, lon)
+            return {"patch":{"official_warnings":alerts},"sources":[{"source":"Configured CAP feed","status":"degraded" if invalid else "ok","records":len(alerts),"invalid_records":invalid}],"elapsed_ms":round((time.time()-started)*1000,1)}
         except Exception as exc:
             return {"patch":{},"sources":[{"source":"Configured CAP feed","status":"error","error":str(exc)}],"elapsed_ms":round((time.time()-started)*1000,1)}
 

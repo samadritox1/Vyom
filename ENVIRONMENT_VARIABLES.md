@@ -8,8 +8,18 @@ Create your own `.env` in the project root. Do not commit secrets to Git.
 - `MISTRAL_API_KEY` — fallback LLM API key.
 - `MONGO_URI` — MongoDB connection string.
 - `SMTP_EMAIL`, `SMTP_APP_PASSWORD`, `SMTP_HOST`, `SMTP_PORT` — optional email alerts.
-- `VYOM_ADMIN_TOKEN` — protects administrative/verified-outcome operations where enabled.
+- `CLERK_ISSUER` — exact HTTPS issuer for frontend Clerk session tokens.
+- `CLERK_AUTHORIZED_PARTIES` — comma-separated exact allowed frontend origins.
+- `CLERK_SECRET_KEY` — server-only Clerk key for verifying email recipients.
+- `CLERK_JWT_PUBLIC_KEY` — optional RSA PEM verification key; otherwise issuer JWKS is used.
+- `CLERK_AUDIENCE` — optional session-token audience to enforce when configured.
+- `VYOM_ADMIN_TOKEN` — server-only token of at least 32 characters; required by administrative endpoints through `X-VYOM-Admin-Token`.
+- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY_PATH`, `VAPID_SUBJECT` — fresh matching P-256 push pair and real operator contact. No repository-key fallback.
 - `VYOM_USER_AGENT` — descriptive contact User-Agent for external public-data services.
+
+See [SECURITY_DEPLOYMENT.md](docs/SECURITY_DEPLOYMENT.md) for required setup,
+push-key replacement and alert consent renewal. `.env.example` contains placeholders,
+not working credentials. Host environment values take precedence over `.env`.
 
 ## Agriculture
 
